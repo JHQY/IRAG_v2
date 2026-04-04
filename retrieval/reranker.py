@@ -6,164 +6,145 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 class Reranker:
     """
-    智能多模态 Reranker：
-    1. 自动识别输入是纯文本还是表格 JSON
-    2. 对表格进行结构化解析与格式化（Markdown/Key-Value）
-    3. 支持单模型或双模型（文本/表格分别用不同模型）架构
+    保险表格专用Reranker（带调试模式）
     """
 
     def __init__(
             self,
-            model_name: str = "BAAI/bge-reranker-base",
-            table_model_name: str = None,
+            model_name: str = "BAAI/bge-reranker-large",
             device: str = None,
-            table_format: str = "markdown"  # 可选: "markdown", "keyvalue", "json"
+            table_boost: float = 0.3,  # 表格分数加成
+            table_max_length: int = 1024,
+            debug: bool = True  # 【新增】调试开关，默认开启，看完日志后可改为False
     ):
-        """
-        :param model_name: 通用文本重排模型
-        :param table_model_name: (可选) 专门针对表格优化的重排模型
-        :param device: 计算设备
-        :param table_format: 表格序列化方式
-        """
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.table_format = table_format
+        self.table_boost = table_boost
+        self.table_max_length = table_max_length
+        self.debug = debug
 
-        # 初始化通用模型
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
         self.model.to(self.device)
         self.model.eval()
 
-        # 初始化表格专用模型（如果提供）
-        self.use_dual_model = table_model_name is not None
-        if self.use_dual_model:
-            self.table_tokenizer = AutoTokenizer.from_pretrained(table_model_name)
-            self.table_model = AutoModelForSequenceClassification.from_pretrained(table_model_name)
-            self.table_model.to(self.device)
-            self.table_model.eval()
-
     def _is_json_table(self, text: str) -> dict:
-        """
-        检测输入字符串是否为 retriever 传来的表格 JSON
-        返回解析后的 dict，若不是则返回 None
-        """
-        if not text or not text.strip().startswith('{'):
+        if not text or len(text) < 20 or not text.strip().startswith('{'):
             return None
         try:
             data = json.loads(text)
-            # 简单的 schema 校验：必须包含 header 和 rows
-            if isinstance(data, dict) and "header" in data and "rows" in data:
+            if isinstance(data, dict) and "header" in data and "rows" in data and len(data["rows"]) > 0:
                 return data
         except Exception:
             pass
         return None
 
-    def _format_table(self, table_data: dict) -> str:
-        """
-        将表格 dict 格式化为对模型友好的字符串
-        """
+    def _format_insurance_table(self, table_data: dict, query: str) -> str:
         header = table_data.get("header", [])
         rows = table_data.get("rows", [])
+        query_lower = query.lower()
 
-        if not header:
-            return json.dumps(table_data, ensure_ascii=False)
+        column_keywords = ["金额", "赔付", "保额", "保费", "最高", "最低", "平均", "总计", "限额"]
+        is_column_query = any(k in query_lower for k in column_keywords)
 
-        if self.table_format == "markdown":
-            # 方案1: Markdown 表格 (对通用语言模型最友好)
-            lines = []
-            lines.append(f"| {' | '.join(map(str, header))} |")
-            lines.append(f"| {' | '.join(['---'] * len(header))} |")
-            for row in rows:
-                # 确保行长度一致
-                padded_row = list(row) + [''] * (len(header) - len(row))
-                lines.append(f"| {' | '.join(map(str, padded_row[:len(header)]))} |")
-            return "\n".join(lines)
+        if is_column_query:
+            col_texts = []
+            for col_idx, col_name in enumerate(header):
+                col_name_lower = col_name.lower()
+                prefix = "【关键列】" if any(k in col_name_lower for k in column_keywords) else ""
+                col_values = [str(row[col_idx]) for row in rows if len(row) > col_idx]
+                col_texts.append(f"{prefix}{col_name}：{', '.join(col_values)}")
+            return "\n".join(col_texts)
 
-        elif self.table_format == "keyvalue":
-            # 方案2: Key-Value 对 (适合列数少但行数多的表，或针对检索特定行)
-            lines = []
+        row_keywords = ["哪个", "什么", "包含", "包括", "范围"]
+        is_row_query = any(k in query_lower for k in row_keywords)
+
+        if is_row_query:
+            row_texts = []
             for row_idx, row in enumerate(rows):
-                cells = [f"{header[i]}: {row[i]}" for i in range(min(len(header), len(row)))]
-                lines.append(f"[Row {row_idx + 1}] " + "; ".join(cells))
-            return "\n".join(lines)
+                cells = [f"{header[i]}：{row[i]}" for i in range(min(len(header), len(row)))]
+                row_texts.append(f"保障项目{row_idx + 1}：{' | '.join(cells)}")
+            return "\n".join(row_texts)
 
-        # 兜底：原始 JSON
-        return json.dumps(table_data, ensure_ascii=False)
+        md_lines = [f"| {' | '.join(map(str, header))} |"]
+        md_lines.append(f"| {' | '.join(['---'] * len(header))} |")
+        for row in rows[:10]:
+            md_lines.append(f"| {' | '.join(map(str, row))} |")
+        return "\n".join(md_lines)
 
     def rerank(self, query: str, texts: List[str]) -> List[float]:
-        """
-        输入:
-            query: str
-            texts: List[str] (可以是纯文本，也可以是表格 JSON 字符串)
-        输出:
-            List[float] 对应每个文本的相关性分数
-        """
-        # 1. 预处理：分离文本和表格，分别构建输入对
-        # 即使是单模型，我们也希望把表格变成更好的格式
+        if not texts:
+            return []
+
+        # --- 1. 预处理 ---
         processed_texts = []
-        is_table_flags = []  # 标记哪些是表格
+        is_table_flags = []
+        original_texts = []  # 保存原始文本用于调试
 
         for text in texts:
+            original_texts.append(text)
             table_data = self._is_json_table(text)
             if table_data:
-                # 是表格，进行格式化
-                processed_texts.append(self._format_table(table_data))
+                processed = self._format_insurance_table(table_data, query)
+                processed_texts.append(processed)
                 is_table_flags.append(True)
             else:
-                # 是普通文本
                 processed_texts.append(text)
                 is_table_flags.append(False)
 
-        # 2. 推理策略
-        if not self.use_dual_model:
-            # 策略 A：单模型流 (默认)
-            # 所有输入（格式化后的表格+文本）一起进通用模型
-            pairs = [[query, t] for t in processed_texts]
-            inputs = self.tokenizer(
-                pairs,
-                padding=True,
-                truncation=True,
-                max_length=512,
-                return_tensors="pt"
-            ).to(self.device)
+        # --- 2. 模型推理 ---
+        pairs = [[query, t] for t in processed_texts]
+        inputs = self.tokenizer(
+            pairs,
+            padding=True,
+            truncation=True,
+            max_length=self.table_max_length,
+            return_tensors="pt"
+        ).to(self.device)
 
-            with torch.no_grad():
-                scores = self.model(**inputs).logits.squeeze(-1)
+        with torch.no_grad():
+            scores = self.model(**inputs).logits.squeeze(-1).cpu().tolist()
 
-            return scores.cpu().tolist()
+        # --- 3. 分数加成 ---
+        final_scores = []
+        for score, is_table in zip(scores, is_table_flags):
+            if is_table:
+                final_scores.append(score + self.table_boost)
+            else:
+                final_scores.append(score)
 
-        else:
-            # 策略 B：双模型流 (进阶)
-            # 文本进文本模型，表格进表格模型
-            # 注意：这需要分别 batch 处理以保证效率
+        # --- 4. 调试打印 (核心新增部分) ---
+        if self.debug:
+            self._print_debug_info(query, original_texts, processed_texts, is_table_flags, scores, final_scores)
 
-            # 收集索引
-            text_indices = [i for i, is_table in enumerate(is_table_flags) if not is_table]
-            table_indices = [i for i, is_table in enumerate(is_table_flags) if is_table]
+        return final_scores
 
-            all_scores = [0.0] * len(texts)
+    def _print_debug_info(self, query, original_texts, processed_texts, is_table_flags, raw_scores, boosted_scores):
+        """漂亮地打印调试信息"""
+        print("\n" + "=" * 80)
+        print(f"🔍 [Rerank Debug] 用户查询: {query}")
+        print("=" * 80)
 
-            # 处理文本
-            if text_indices:
-                text_batch = [processed_texts[i] for i in text_indices]
-                text_pairs = [[query, t] for t in text_batch]
-                inputs = self.tokenizer(text_pairs, padding=True, truncation=True, max_length=512,
-                                        return_tensors="pt").to(self.device)
-                with torch.no_grad():
-                    scores = self.model(**inputs).logits.squeeze(-1).cpu().tolist()
-                for idx, score in zip(text_indices, scores):
-                    all_scores[idx] = score
+        # 打包并排序（按最终分数从高到低）
+        candidates = list(zip(range(len(original_texts)), original_texts, processed_texts, is_table_flags, raw_scores,
+                              boosted_scores))
+        candidates.sort(key=lambda x: x[5], reverse=True)  # 按加成后的分数排序
 
-            # 处理表格
-            if table_indices:
-                table_batch = [processed_texts[i] for i in table_indices]
-                table_pairs = [[query, t] for t in table_batch]
-                # 表格通常较长，适当放宽 max_length
-                inputs = self.table_tokenizer(table_pairs, padding=True, truncation=True, max_length=1024,
-                                              return_tensors="pt").to(self.device)
-                with torch.no_grad():
-                    scores = self.table_model(**inputs).logits.squeeze(-1).cpu().tolist()
-                for idx, score in zip(table_indices, scores):
-                    all_scores[idx] = score
+        for idx, (orig_idx, orig_text, proc_text, is_table, raw_s, boost_s) in enumerate(candidates):
+            status = "🟢 表格 (TABLE)" if is_table else "⚪ 文本 (TEXT)"
+            print(f"\n--- 排名 {idx + 1} (原始索引: {orig_idx}) | {status} ---")
+            print(
+                f"   原始模型分: {raw_s:.4f} | 加成后分数: {boost_s:.4f} (加成: +{self.table_boost if is_table else 0})")
 
-            return all_scores
+            # 打印处理后的文本预览（前200字符）
+            preview = proc_text[:200].replace('\n', ' ')
+            print(f"   输入模型文本: {preview}{'...' if len(proc_text) > 200 else ''}")
+
+            # 如果是表格，额外打印原始JSON的表头
+            if is_table:
+                try:
+                    data = json.loads(orig_text)
+                    print(f"   [表格结构] 表头: {data.get('header', [])} | 行数: {len(data.get('rows', []))}")
+                except:
+                    pass
+
+        print("\n" + "=" * 80 + "\n")

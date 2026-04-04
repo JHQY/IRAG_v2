@@ -145,22 +145,25 @@ class RAGInterface:
         )
 
     def _build_context_text(self, item: dict) -> str:
+        parts = []
+        # 先加文本内容（如果有）
         text = item.get("text") or ""
         if text:
-            return text
+            parts.append(text)
 
+        # 再加表格内容（如果有）—— 这是原来缺失的关键部分
         table = item.get("table") or {}
-        if not table:
-            return ""
+        if table:
+            header = [str(cell) for cell in table.get("header", [])]
+            rows = table.get("rows", [])
+            if header and rows:
+                parts.append("\n【表格数据】")
+                parts.append(" | ".join(header))
+                parts.append(" | ".join(["---"] * len(header)))
+                for row in rows:
+                    parts.append(" | ".join(str(cell) for cell in row))
 
-        header = [str(cell) for cell in table.get("header", [])]
-        rows = table.get("rows", [])
-        lines = []
-        if header:
-            lines.append(" | ".join(header))
-        for row in rows:
-            lines.append(" | ".join(str(cell) for cell in row))
-        return "\n".join(lines)
+        return "\n".join(parts)
 
     def retrieve_context(self, query: str, top_k: int = 5):
         hits = self.retrieve(query, top_k=top_k)
