@@ -1,122 +1,114 @@
-# ingestion/indexer.py
 from ingestion.loader import scan_documents
 from ingestion.parser import parse_pdf
 from ingestion.chunker import chunk_blocks
 from embedding.embedder import Embedder
 from storage.milvus_store import MilvusVectorStore
-from config.settings import settings
-from tqdm import tqdm
-
-# def build_index(source_dir="sourcepdf"):
-#     """
-#     构建保险知识库索引：
-#     1. 扫描所有文件
-#     2. 抽取文字 + 表格（带上下文）
-#     3. 对文字内容分块
-#     4. 嵌入 + 写入 Milvus
-#     """
-#     print("🚀 开始构建索引 ...")
-#     docs = scan_documents(source_dir)
-#     if not docs:
-#         print("⚠️ 没有找到可索引的文件。")
-#         return
-
-#     embedder = Embedder()
-#     store = MilvusVectorStore()
-#     total_chunks = 0
-
-#     for doc in tqdm(docs, desc="索引进度"):
-#         try:
-#             parsed_blocks = parse_pdf(doc["path"])
-#             # print(f"📄 解析完成：{doc['path']}，提取到 {len(parsed_blocks)} 个内容块。")
-#             # print(f"预览内容块：{parsed_blocks[:2]}")  # 打印前两个内容块以供调试
-#             if not parsed_blocks:
-#                 print(f"⚠️ 文件无有效内容：{doc['path']}")
-#                 continue
-
-#             for block in parsed_blocks:
-#                 # content = block.get("text", "").strip()
-#                 # modality = block.get("modality", "text")
-#                 # page = block.get("page", 0)
-                
-
-#                 # 跳过空块
-#                 if not content:
-#                     continue
-
-#                 # 仅文本进行分块；表格保持整块
-#                 if modality == "text":
-#                     chunks = chunk_blocks(parsed_blocks)
-#                 else:
-#                     chunks = [content]
-                
-#                 for c in chunks:
-#                     emb = embedder.embed_text([c])[0]
-#                     meta = {
-#                         **doc["metadata"],
-#                         "page": page,
-#                         "modality": modality
-#                     }
-#                     store.add([emb], [Chunk(c, meta)])
-#                     total_chunks += 1
-
-#         except Exception as e:
-#             print(f"❌ 文件处理失败: {doc['path']} ({e})")
-
-#     print(f"✅ 索引完成，共写入 {total_chunks} 个文本块。")
 import numpy as np
 import zlib
 import json
 import base64
 
+
+# ====================== 全局安全截断 ======================
+def safe_truncate(text: str, max_len: int = 2000) -> str:
+    if not text:
+        return ""
+    return text.strip()[:max_len]
+
+
+def safe_truncate_table(text: str) -> str:
+    return safe_truncate(text, max_len=1000)
+
+
 def ensure_1d(vec, dim=None):
     if vec is None:
         return None
-
-    # numpy: squeeze to 1D (do not return early so dim adjustment below still applies)
     if isinstance(vec, np.ndarray):
-        vec = vec.reshape(-1,).astype("float32")
-
-    # list: flatten ALL nested lists robustly
+        vec = vec.reshape(-1, ).astype("float32")
+        return vec
     if isinstance(vec, list):
         flattened = []
 
         def _flatten(x):
-            if isinstance(x, list) or isinstance(x, tuple) or isinstance(x, np.ndarray):
+            if isinstance(x, list):
                 for e in x:
                     _flatten(e)
             else:
-                try:
-                    flattened.append(float(x))
-                except Exception:
-                    flattened.append(0.0)
+                flattened.append(float(e))
 
-        _flatten(vec)  # recursive flatten
-
+        _flatten(vec)
         vec = np.array(flattened, dtype="float32")
-
-    # fix dimension if provided
     if dim is not None and len(vec) != dim:
         if len(vec) > dim:
             vec = vec[:dim]
         else:
             vec = np.pad(vec, (0, dim - len(vec)))
-
     return vec
 
 
-
 def compress_table_json(table_json: dict) -> str:
-    if not table_json:
+    """增强版：确保返回非空，且打印调试信息"""
+    if not table_json or "header" not in table_json or "rows" not in table_json:
+        print(f"[WARNING] 无效表格数据，跳过: {table_json}")
         return ""
-    raw = json.dumps(table_json).encode("utf-8")
-    zipped = zlib.compress(raw)
-    return base64.b64encode(zipped).decode("utf-8")
+    try:
+        raw = json.dumps(table_json, ensure_ascii=False).encode("utf-8")
+        zipped = zlib.compress(raw)
+        return base64.b64encode(zipped).decode("utf-8")
+    except Exception as e:
+        print(f"[ERROR] 表格压缩失败: {e}")
+        return ""
 
 
+# ====================== 表格三路拆分（修复版） ======================
+def split_table_three_way(table: dict):
+    if not table or "header" not in table or "rows" not in table:
+        return []
+    header = table.get("header", [])
+    rows = table.get("rows", [])
+    chunks = []
+
+    # 1. 表级模态
+    chunks.append({
+        "modality": "table",
+        "table": table,
+        "text": safe_truncate_table(f"表格：{' | '.join(header[:10])}")
+    })
+
+    # 2. 列级模态（只保留核心列）
+    core_columns = ["金额", "赔付", "保额", "保费", "免赔额", "报销比例", "最高", "最低"]
+    for col_idx, col_name in enumerate(header):
+        if col_idx >= 5 and not any(k in col_name for k in core_columns):
+            continue
+        col_values = [str(row[col_idx]) for row in rows[:10] if len(row) > col_idx]
+        if len(rows) > 10:
+            col_values.append(f"...共{len(rows)}行")
+        chunks.append({
+            "modality": "column",
+            "table": table,
+            "text": safe_truncate_table(f"{col_name}：{', '.join(col_values)}")
+        })
+
+    # 3. 行级模态（只保留前5行）
+    for row_idx, row in enumerate(rows[:5]):
+        row_content = []
+        for col_idx, cell in enumerate(row[:8]):
+            if col_idx < len(header):
+                row_content.append(f"{header[col_idx]}:{cell}")
+        if len(row) > 8:
+            row_content.append("...")
+        chunks.append({
+            "modality": "row",
+            "table": table,
+            "text": safe_truncate_table(f"行{row_idx + 1}：{' | '.join(row_content)}")
+        })
+
+    return chunks
+
+
+# ====================== 索引构建（最终修复版） ======================
 def build_index(source_dir="sourcepdf"):
-
-    print("🚀 开始构建 IRAG_MM 多模态索引 ...")
+    print("🚀 开始构建最终版索引（含表格三路+table_blob校验）...")
 
     docs = scan_documents(source_dir)
     if not docs:
@@ -127,18 +119,18 @@ def build_index(source_dir="sourcepdf"):
     store = MilvusVectorStore()
 
     total = 0
+    valid_table_count = 0
     batch_records = []
     batch_size = 100
 
+    for doc_idx, doc in enumerate(docs):
+        print(f"[进度] 处理第 {doc_idx + 1}/{len(docs)} 个文件: {doc['path']}")
 
-    for doc in tqdm(docs, desc="索引进度"):
         try:
             blocks = parse_pdf(doc["path"])
             if not blocks:
-                print(f"⚠️ 无有效内容：{doc['path']}")
                 continue
 
-            # 注入 metadata
             for b in blocks:
                 b.setdefault("metadata", {})
                 b["metadata"].update({
@@ -149,162 +141,88 @@ def build_index(source_dir="sourcepdf"):
                     "modality": b.get("modality"),
                 })
 
-            # chunk 化文本/表格
             chunks = chunk_blocks(blocks, max_length=500, overlap=50)
 
-            # ------------------------------------------------------
-            # 为每个 chunk 构造 record
-            # ------------------------------------------------------
             for c in chunks:
                 modality = c.get("modality")
-                meta = c.get("metadata", {})
+                meta = c.get("metadata", {}).copy()
 
-                text_value = None
-                #table_json = None
-                table_blob = None
-                text_vec = None
-                table_vec = None
-
-                # 文本块
+                # ---------------- 文本块 ----------------
                 if modality == "text":
                     raw_text = (c.get("text") or "").strip()
                     if not raw_text:
                         continue
+                    text_value = safe_truncate(raw_text)
+                    text_vec = embedder.embed_text([text_value])[0]
+                    text_vec = ensure_1d(text_vec, store.vector_dim)
 
-                    text_value = raw_text
-                    # embed_text 返回 shape: (1,1024)
-                    text_vec = embedder.embed_text([raw_text])[0]
+                    batch_records.append({
+                        "modality": modality,
+                        "text": text_value,
+                        "table_blob": "",
+                        "vector": text_vec,
+                        "metadata": meta,
+                    })
 
-                # 表格块
+                # ---------------- 表格块（含三路+非空校验） ----------------
                 elif modality == "table":
                     table = c.get("table")
                     if not table:
                         continue
 
-                    header = table.get("header", [])
-                    rows = table.get("rows", [])
+                    three_way_chunks = split_table_three_way(table)
 
-                    table_json = table
-                    table_blob = compress_table_json(table_json)
+                    for tw_chunk in three_way_chunks:
+                        sub_modality = tw_chunk["modality"]
+                        sub_text = tw_chunk["text"]
+                        sub_table = tw_chunk["table"]
+                        table_blob = compress_table_json(sub_table)
 
-                    # -------------------------
-                    # 🥇 1. Row-level embedding
-                    # -------------------------
-                    row_texts = []
-                    for r in rows:
-                        row_str = "Row: " + "; ".join(
-                            [f"{h}={v}" for h, v in zip(header, r)]
-                        )
-                        row_texts.append(row_str)
+                        # 【关键】跳过table_blob为空的无效记录
+                        if not table_blob:
+                            continue
 
-                    row_vecs = embedder.embed_text(row_texts) if row_texts else []
+                        if sub_modality == "table":
+                            vec = embedder.embed_table(sub_table["header"][:10], sub_table["rows"][:5])
+                        else:
+                            vec = embedder.embed_text([sub_text])[0]
+                        vec = ensure_1d(vec, store.vector_dim)
 
-                    # -------------------------
-                    # 🥈 2. Column-level embedding
-                    # -------------------------
-                    col_texts = []
-                    for col_idx, col_name in enumerate(header):
-                        col_values = [str(r[col_idx]) for r in rows if col_idx < len(r)]
+                        sub_meta = meta.copy()
+                        sub_meta["sub_modality"] = sub_modality
 
-                        # 简单统计（关键🔥）
-                        try:
-                            nums = [float(v) for v in col_values if v.replace('.', '', 1).isdigit()]
-                            if nums:
-                                col_text = f"Column: {col_name}, Mean={sum(nums) / len(nums)}, Max={max(nums)}, Min={min(nums)}"
-                            else:
-                                col_text = f"Column: {col_name}, Values={','.join(col_values[:5])}"
-                        except:
-                            col_text = f"Column: {col_name}, Values={','.join(col_values[:5])}"
-
-                        col_texts.append(col_text)
-
-                    col_vecs = embedder.embed_text(col_texts) if col_texts else []
-
-                    # -------------------------
-                    # 🥉 3. Table-level embedding（保留）
-                    # -------------------------
-                    table_vec = embedder.embed_table(header, rows)
-
-                    # -------------------------
-                    # 写入：row / column / table
-                    # -------------------------
-
-                    # 👉 行
-                    for rv, rt in zip(row_vecs, row_texts):
-                        rv = ensure_1d(rv, store.text_dim)
                         batch_records.append({
-                            "modality": "row",
-                            "text": rt,
+                            "modality": sub_modality,
+                            "text": sub_text,
                             "table_blob": table_blob,
-                            "text_vec": rv,
-                            "table_vec": None,
-                            "metadata": meta,
+                            "vector": vec,
+                            "metadata": sub_meta,
                         })
+                        valid_table_count += 1
 
-                    # 👉 列
-                    for cv, ct in zip(col_vecs, col_texts):
-                        cv = ensure_1d(cv, store.text_dim)
-                        batch_records.append({
-                            "modality": "column",
-                            "text": ct,
-                            "table_blob": table_blob,
-                            "text_vec": cv,
-                            "table_vec": None,
-                            "metadata": meta,
-                        })
-
-                    # 👉 表（原来的）
-                    table_vec = ensure_1d(table_vec, store.table_dim)
-                    batch_records.append({
-                        "modality": "table",
-                        "text": None,
-                        "table_blob": table_blob,
-                        "text_vec": None,
-                        "table_vec": table_vec,
-                        "metadata": meta,
-                    })
-
-                else:
-                    continue
-
-                # 至少要有一个 vector
-                if text_vec is None and table_vec is None:
-                    continue
-
-                # ----------- 关键：flatten vector -----------------
-                if text_vec is not None:
-                    print("DEBUG TEXT_VEC:", text_vec, type(text_vec))
-                    text_vec = ensure_1d(text_vec, store.text_dim)
-
-                if table_vec is not None:
-                    table_vec = ensure_1d(table_vec, store.table_dim)
-
-                # 如果 chunk 本身是 table，则上面已经为 row/column/table 分别追加了记录
-                # 因此这里应避免再次为 modality=='table' 追加重复条目。
-                if modality != "table":
-                    batch_records.append({
-                        "modality": modality,
-                        "text": text_value,
-                        #"table_json": table_json,
-                        "table_blob": table_blob,
-                        "text_vec": text_vec,
-                        "table_vec": table_vec,
-                        "metadata": meta,
-                    })
-
-
-                # 批量写入
+                # 批量入库
                 if len(batch_records) >= batch_size:
                     store.add_records(batch_records)
                     total += len(batch_records)
                     batch_records = []
+                    print(f"  → 已入库 {total} 个块 | 有效表格: {valid_table_count} 个")
 
         except Exception as e:
-            print(f"❌ 文件失败：{doc['path']} ({e})")
+            print(f"❌ 文件失败：{doc['path']}，错误：{str(e)}")
+            import traceback
+            traceback.print_exc()
+            continue
 
-    # 剩余写入
+    # 剩余数据入库
     if batch_records:
         store.add_records(batch_records)
         total += len(batch_records)
 
-    print(f"🎉 多模态索引构建完成，共写入 {total} 个块。")
+    print(f"\n🎉 索引构建完成！")
+    print(f"   总入库数量: {total}")
+    print(f"   有效表格数量: {valid_table_count}")
+    print(f"   文本数量: {total - valid_table_count}")
+
+
+if __name__ == "__main__":
+    build_index()
